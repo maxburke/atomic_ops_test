@@ -1,6 +1,10 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
-#include <windows.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
 
 // The list of tests.
 #define TESTS \
@@ -51,11 +55,26 @@ static const char *interference_name(int which)
 
 static void lock_to_logical_core(uint32_t which)
 {
-    SetThreadAffinityMask(GetCurrentThread(), 1 << which);
+    cpu_set_t cpu_set;
+    int num_cores;
+
+    num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (which >= num_cores) {
+        printf("Num cores: %d\n", num_cores);
+        exit(1);
+    }
+
+    CPU_ZERO(&cpu_set);
+    CPU_SET(which, &cpu_set);
+    if (sched_setaffinity(0, sizeof cpu_set, &cpu_set) < 0) {
+        perror("Unable to set affinity");
+        exit(1);
+    }
 }
 
 // Interference thread
-enum { NUM_INTERFERENCE_THREADS = 7 };
+enum { NUM_INTERFERENCE_THREADS = 3 };
 
 typedef struct {
     int core_id;
@@ -64,15 +83,15 @@ typedef struct {
 
 // Scratch area. This is where our memory updates go to.
 // Cache-line aligned (on x86-64).
-static __declspec(align(64)) uint64_t scratch[16];
+static uint64_t scratch[16] __attribute__((aligned(64)));
 
 // We use this event to signal to the interference thread that it's time to exit.
-static HANDLE exit_event;
+static volatile long time_to_exit;
 
 // Number of threads that have started running the interference main loop.
-static volatile LONG num_running;
+static volatile long num_running;
 
-static unsigned int __stdcall interference_thread(void *argp)
+static void *interference_thread(void *argp)
 {
     const thread_args *args = (const thread_args *)argp;
     uint64_t private_mem[8] = { 0 };
@@ -121,7 +140,7 @@ static unsigned int __stdcall interference_thread(void *argp)
     }
 
     // main loop
-    while (WaitForSingleObject(exit_event, 0) == WAIT_TIMEOUT) {
+    while (!time_to_exit) {
         if (!do_writes)
             interference_read(interfere_ptr);
         else
@@ -131,7 +150,7 @@ static unsigned int __stdcall interference_thread(void *argp)
         // this thread counts as "running".
         if (just_started) {
             just_started = 0;
-            InterlockedIncrement(&num_running);
+            __sync_add_and_fetch(&num_running, 1);
         }
     }
 
@@ -166,27 +185,28 @@ int main()
 {
     int interference_mode;
 
-    exit_event = CreateEvent(NULL, TRUE, FALSE, NULL);
     lock_to_logical_core(0);
 
     for (interference_mode = 0; interference_mode < IM_count; interference_mode++) {
         thread_args args[NUM_INTERFERENCE_THREADS];
-        HANDLE threads[NUM_INTERFERENCE_THREADS];
+        pthread_t threads[NUM_INTERFERENCE_THREADS];
+        pthread_attr_t attr;
         int i;
 
         printf("interference type: %s\n", interference_name(interference_mode));
+        pthread_attr_init(&attr);
 
         // start the interference threads
         num_running = 0;
         for (i = 0; i < NUM_INTERFERENCE_THREADS; i++) {
             args[i].core_id = i + 1;
             args[i].interference_mode = interference_mode;
-            threads[i] = (HANDLE) _beginthreadex(NULL, 0, interference_thread, &args[i], 0, NULL);
+            pthread_create(&threads[i], &attr, interference_thread, &args[i]);
         }
 
         // wait until they're all running (yeah, evil spin loop)
         while (num_running < NUM_INTERFERENCE_THREADS)
-            Sleep(0);
+            sleep(0);
         
         // run our tests
         #define T(id) printf("%16s: %8.2f cycles/op\n", #id, (double) run_test(test_##id) / 40000.0);
@@ -194,14 +214,17 @@ int main()
         #undef T
 
         // wait for thread to shut down
-        SetEvent(exit_event);
-        WaitForMultipleObjects(NUM_INTERFERENCE_THREADS, threads, TRUE, INFINITE);
-        ResetEvent(exit_event);
-        for (i = 0; i < NUM_INTERFERENCE_THREADS; i++)
-            CloseHandle(threads[i]);
-    }
+        time_to_exit = 1;
 
-    CloseHandle(exit_event);
+        for (i = 0; i < NUM_INTERFERENCE_THREADS; i++) {
+            void *res;
+            pthread_join(threads[i], &res);
+        }
+
+        pthread_attr_destroy(&attr);
+
+        time_to_exit = 0;
+    }
 
     return 0;
 }

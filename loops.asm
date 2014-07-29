@@ -8,8 +8,8 @@
 
 %macro perf_start 1
         public_fn %1
-        mov r9, rcx ; save first arg into r9
-        rdtscp
+        mov r9, rdi ; save first arg into r9
+        rdtsc
         shl rdx, 32
         or rdx, rax
         mov r8, rdx
@@ -22,7 +22,7 @@
         dec ecx
         jnz .lp
 
-        rdtscp
+        rdtsc
         shl rdx, 32
         or rax, rdx
         sub rax, r8
@@ -140,6 +140,7 @@
 .lp:
         ; NOTE: mix of reads and writes here;
         ; with pure writes it's easy to completely starve the cmpxchg variants.
+        mov rcx, rdi
         add rax, [rcx]
         mov [rcx], rdx
         add rax, [rcx+8]
